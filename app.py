@@ -678,4 +678,3 @@ if run:
             )
 else:
     st.info("Click **Run Earnings Radar** in the sidebar to fetch data.")
-
