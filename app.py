@@ -1,12 +1,15 @@
 import math
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 import altair as alt
+
+# IMPORTANT: curl_cffi improves Yahoo endpoints reliability (esp earnings dates)
+from curl_cffi import requests as c_requests
 
 # -----------------------------------------------------------------------------
 # Page
@@ -17,7 +20,7 @@ alt.data_transformers.disable_max_rows()
 st.title("📡 Earnings Radar")
 st.caption(
     "Portfolio-first earnings monitoring. Upload holdings to get next earnings + price context, "
-    "and review last 4 earnings reactions."
+    "and review last 4 earnings reactions. (ETFs usually have no earnings.)"
 )
 
 # -----------------------------------------------------------------------------
@@ -53,7 +56,7 @@ def chunk_list(xs: List[str], n: int) -> List[List[str]]:
     return [xs[i: i + n] for i in range(0, len(xs), n)]
 
 
-def today_utc_date() -> "datetime":
+def today_utc_date() -> datetime:
     return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
@@ -62,37 +65,22 @@ def _normalize_ticker(t: str) -> str:
 
 
 def read_portfolio_file(uploaded) -> pd.DataFrame:
-    """
-    Reads CSV or Excel based on file extension.
-    """
     name = (uploaded.name or "").lower()
     if name.endswith(".csv"):
         return pd.read_csv(uploaded)
     if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded)  # requires openpyxl for .xlsx
+        return pd.read_excel(uploaded)  # requires openpyxl
     raise ValueError("Unsupported file type. Please upload a .csv, .xlsx, or .xls file.")
 
 
 def find_ticker_column(df: pd.DataFrame) -> Optional[str]:
-    """
-    Try to locate a ticker column from common names.
-    """
-    candidates = [
-        "Ticker",
-        "Symbol",
-        "Ticker Symbol",
-        "Trading Symbol",
-        "Security",
-        "Instrument",
-    ]
+    candidates = ["Ticker", "Symbol", "Ticker Symbol", "Trading Symbol", "Security", "Instrument"]
     cols = list(df.columns)
 
-    # exact match first
     for c in candidates:
         if c in cols:
             return c
 
-    # case-insensitive match
     lower_map = {str(c).strip().lower(): c for c in cols}
     for c in candidates:
         key = str(c).strip().lower()
@@ -103,7 +91,21 @@ def find_ticker_column(df: pd.DataFrame) -> Optional[str]:
 
 
 # -----------------------------------------------------------------------------
-# Universe loading (for tagging)
+# Sessions (curl_cffi)
+# -----------------------------------------------------------------------------
+@st.cache_resource
+def get_impersonated_session() -> c_requests.Session:
+    # Chrome impersonation helps avoid Yahoo blocking / partial responses
+    return c_requests.Session(impersonate="chrome")
+
+
+def get_ticker_obj(ticker: str) -> yf.Ticker:
+    # yfinance supports passing a requests-like session
+    return yf.Ticker(ticker, session=get_impersonated_session())
+
+
+# -----------------------------------------------------------------------------
+# Universe (optional tagging)
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=24 * 3600)
 def load_universe_csv(path: str = "sp500_universe.csv") -> pd.DataFrame:
@@ -122,19 +124,18 @@ def load_universe_csv(path: str = "sp500_universe.csv") -> pd.DataFrame:
     return df
 
 
+try:
+    universe = load_universe_csv("sp500_universe.csv")
+    meta = universe[["Ticker", "Company", "Sector", "Industry"]].drop_duplicates(subset=["Ticker"]).set_index("Ticker")
+except Exception:
+    # Universe is optional; app still works without it
+    meta = pd.DataFrame(columns=["Company", "Sector", "Industry"]).set_index(pd.Index([], name="Ticker"))
+
 # -----------------------------------------------------------------------------
-# Price metrics (batched) via yf.download
+# Price metrics (batched) via yf.download (fast + reliable)
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
 def fetch_1y_price_metrics(tickers: List[str]) -> pd.DataFrame:
-    """
-    Returns per ticker:
-      - current (last close)
-      - 52w high / low
-      - Δ vs 52w high (%)
-      - Δ vs 52w low (%)
-      - 52w range (%)
-    """
     if not tickers:
         return pd.DataFrame()
 
@@ -216,44 +217,103 @@ def fetch_1y_price_metrics(tickers: List[str]) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
-# Earnings (cached)
+# Earnings: robust next earnings + history
 # -----------------------------------------------------------------------------
+def _is_etf_or_fund(info: Dict[str, Any]) -> bool:
+    qt = str(info.get("quoteType", "")).upper()
+    return qt in {"ETF", "MUTUALFUND", "FUND", "INDEX"}
+
+
+def _pick_next_from_info(info: Dict[str, Any]) -> Optional[pd.Timestamp]:
+    """
+    Yahoo sometimes provides:
+      earningsTimestampStart / earningsTimestampEnd / earningsTimestamp
+    We try these if get_earnings_dates doesn't include future events.
+    """
+    candidates = []
+    for k in ["earningsTimestampStart", "earningsTimestamp", "earningsTimestampEnd"]:
+        v = info.get(k)
+        if v is None:
+            continue
+        try:
+            ts = pd.to_datetime(int(v), unit="s", utc=True, errors="coerce")
+            if pd.notna(ts):
+                candidates.append(ts)
+        except Exception:
+            pass
+
+    candidates = [c for c in candidates if c >= pd.Timestamp(today_utc_date())]
+    if candidates:
+        return pd.Timestamp(min(candidates))
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def fetch_earnings_dates_df(ticker: str, limit: int = 16) -> pd.DataFrame:
+    """
+    Returns earnings dates table from yfinance (may be empty depending on Yahoo).
+    Uses curl_cffi session for better reliability.
+    """
+    try:
+        t = get_ticker_obj(ticker)
+        df = t.get_earnings_dates(limit=limit)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        df = df.copy()
+        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+        df = df[~df.index.isna()].sort_index()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def fetch_info_minimal(ticker: str) -> Dict[str, Any]:
+    try:
+        t = get_ticker_obj(ticker)
+        info = t.info or {}
+        return info
+    except Exception:
+        return {}
+
+
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
 def fetch_next_earnings_date(ticker: str) -> Optional[pd.Timestamp]:
-    now = today_utc_date()
+    # Step 1: try earnings dates table (future + past)
+    df = fetch_earnings_dates_df(ticker, limit=20)
+    now = pd.Timestamp(today_utc_date())
 
-    # best attempt: earnings table
-    try:
-        t = yf.Ticker(ticker)
-        df = t.get_earnings_dates(limit=12)
-        if df is not None and not df.empty:
-            idx = pd.to_datetime(df.index, utc=True, errors="coerce").dropna()
-            future = idx[idx >= pd.Timestamp(now)]
-            if len(future) > 0:
-                return pd.Timestamp(future.min())
-    except Exception:
-        pass
+    if df is not None and not df.empty:
+        idx = pd.to_datetime(df.index, utc=True, errors="coerce").dropna()
+        future = idx[idx >= now]
+        if len(future) > 0:
+            return pd.Timestamp(future.min())
 
-    # fallback: info['earningsDate']
-    try:
-        t = yf.Ticker(ticker)
-        info = t.info or {}
+    # Step 2: try info timestamps (future earnings)
+    info = fetch_info_minimal(ticker)
+    if info and _is_etf_or_fund(info):
+        return None
+
+    ts = _pick_next_from_info(info) if info else None
+    if ts is not None:
+        return ts
+
+    # Step 3: older-style info key 'earningsDate' (sometimes list)
+    if info:
         ed = info.get("earningsDate")
-        if isinstance(ed, list) and len(ed) > 0:
-            candidates = []
-            for x in ed:
-                ts = pd.to_datetime(x, utc=True, errors="coerce")
-                if pd.notna(ts):
-                    candidates.append(ts)
-            candidates = [c for c in candidates if c >= pd.Timestamp(now)]
-            if candidates:
-                return pd.Timestamp(min(candidates))
-        else:
-            ts = pd.to_datetime(ed, utc=True, errors="coerce")
-            if pd.notna(ts) and ts >= pd.Timestamp(now):
-                return pd.Timestamp(ts)
-    except Exception:
-        pass
+        try:
+            if isinstance(ed, list) and len(ed) > 0:
+                parsed = [pd.to_datetime(x, utc=True, errors="coerce") for x in ed]
+                parsed = [p for p in parsed if pd.notna(p)]
+                parsed = [p for p in parsed if p >= now]
+                if parsed:
+                    return pd.Timestamp(min(parsed))
+            else:
+                p = pd.to_datetime(ed, utc=True, errors="coerce")
+                if pd.notna(p) and p >= now:
+                    return pd.Timestamp(p)
+        except Exception:
+            pass
 
     return None
 
@@ -270,23 +330,8 @@ def fetch_earnings_for_list(tickers: List[str]) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
-# Past 4 earnings + context (portfolio)
+# Past 4 earnings + price context
 # -----------------------------------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=12 * 3600)
-def fetch_earnings_history_table(ticker: str, limit: int = 16) -> pd.DataFrame:
-    try:
-        t = yf.Ticker(ticker)
-        df = t.get_earnings_dates(limit=limit)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        out = df.copy()
-        out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
-        out = out[~out.index.isna()].sort_index()
-        return out
-    except Exception:
-        return pd.DataFrame()
-
-
 @st.cache_data(show_spinner=False, ttl=12 * 3600)
 def fetch_price_history_for_events(ticker: str, period: str = "3y") -> pd.DataFrame:
     try:
@@ -301,7 +346,7 @@ def fetch_price_history_for_events(ticker: str, period: str = "3y") -> pd.DataFr
         if df is None or df.empty:
             return pd.DataFrame()
         df = df.copy()
-        df.index = pd.to_datetime(df.index, utc=True, errors="coerce").tz_convert("UTC")
+        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
         df = df[~df.index.isna()]
         return df
     except Exception:
@@ -352,54 +397,51 @@ def _event_context_from_history(hist: pd.DataFrame, event_ts: pd.Timestamp) -> O
     }
 
 
-def portfolio_last4_rows(ticker: str) -> pd.DataFrame:
-    e = fetch_earnings_history_table(ticker, limit=16)
-    if e.empty:
+def last4_earnings_with_context(ticker: str) -> pd.DataFrame:
+    df = fetch_earnings_dates_df(ticker, limit=20)
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    now = today_utc_date()
-    e = e.sort_index()
-    past = e[e.index < pd.Timestamp(now)]
+    now = pd.Timestamp(today_utc_date())
+    past = df[df.index < now].sort_index()
     if past.empty:
         return pd.DataFrame()
 
-    last4 = past.tail(4).copy()
+    last4 = past.tail(4)
     hist = fetch_price_history_for_events(ticker, period="3y")
 
     rows = []
     for ts, row in last4.iterrows():
-        ctx = _event_context_from_history(hist, ts) if not hist.empty else None
+        ctx = _event_context_from_history(hist, ts) if hist is not None and not hist.empty else None
         base = {"Ticker": ticker, "Earnings Date (UTC)": ts.strftime("%Y-%m-%d")}
+
         for col in ["EPS Estimate", "Reported EPS", "Surprise(%)"]:
             base[col] = _safe_float(row.get(col)) if col in last4.columns else None
+
         if ctx:
             base.update(ctx)
+
         rows.append(base)
 
     return pd.DataFrame(rows)
 
 
 # -----------------------------------------------------------------------------
-# Load universe (for tags)
-# -----------------------------------------------------------------------------
-try:
-    universe = load_universe_csv("sp500_universe.csv")
-except Exception as e:
-    st.error(str(e))
-    st.stop()
-
-meta = universe[["Ticker", "Company", "Sector", "Industry"]].drop_duplicates(subset=["Ticker"]).set_index("Ticker")
-
-# -----------------------------------------------------------------------------
-# Portfolio-first UI
+# UI — Portfolio-first
 # -----------------------------------------------------------------------------
 st.subheader("📤 Upload Portfolio (Primary)")
 st.markdown("Upload a **CSV or Excel** file containing a ticker column (e.g. `Ticker` or `Symbol`).")
 
 portfolio_file = st.file_uploader("Portfolio file", type=["csv", "xlsx", "xls"])
 
-pf_max_names = st.slider("Max tickers to process (speed control)", 5, 120, 40, 5)
-pf_only_next_earnings = st.checkbox("Show only tickers with a next earnings date", value=False)
+colA, colB, colC = st.columns([1, 1, 2])
+with colA:
+    pf_max_names = st.slider("Max tickers to process (speed)", 5, 150, 40, 5)
+with colB:
+    pf_only_next = st.checkbox("Only tickers with next earnings", value=False)
+with colC:
+    debug_mode = st.checkbox("Debug mode (show raw earnings fetch for one ticker)", value=False)
+
 pf_run = st.button("Run Portfolio Earnings Radar", type="primary")
 
 with st.popover("ℹ️ File format help"):
@@ -409,8 +451,12 @@ Accepted files:
 - `.csv`
 - `.xlsx` / `.xls`
 
-We auto-detect ticker columns like:
-`Ticker`, `Symbol`, `Ticker Symbol`, etc.
+Ticker column examples:
+`Ticker`, `Symbol`, `Ticker Symbol`
+
+Notes:
+- ETFs (QQQ/VOO/SOXX etc.) usually have no earnings.
+- Yahoo can temporarily block earnings endpoints; we use a browser-impersonated session to improve reliability.
         """.strip()
     )
 
@@ -439,7 +485,7 @@ if pf_run:
         st.stop()
 
     if len(pf_tickers) > pf_max_names:
-        st.warning(f"Portfolio has {len(pf_tickers)} tickers — showing first {pf_max_names} for speed.")
+        st.warning(f"Portfolio has {len(pf_tickers)} tickers — processing first {pf_max_names} for speed.")
         pf_tickers = pf_tickers[:pf_max_names]
 
     st.divider()
@@ -453,11 +499,18 @@ if pf_run:
 
     ov = pm.merge(ed, on="Ticker", how="left")
     ov["Next Earnings (UTC)"] = pd.to_datetime(ov["Next Earnings (UTC)"], utc=True, errors="coerce")
-    ov["Company"] = ov["Ticker"].apply(lambda t: meta.loc[t, "Company"] if t in meta.index else "")
-    ov["Sector"] = ov["Ticker"].apply(lambda t: meta.loc[t, "Sector"] if t in meta.index else "")
-    ov["Industry"] = ov["Ticker"].apply(lambda t: meta.loc[t, "Industry"] if t in meta.index else "")
 
-    if pf_only_next_earnings:
+    def _meta_get(t: str, col: str) -> str:
+        try:
+            return str(meta.loc[t, col]) if t in meta.index else ""
+        except Exception:
+            return ""
+
+    ov["Company"] = ov["Ticker"].apply(lambda t: _meta_get(t, "Company"))
+    ov["Sector"] = ov["Ticker"].apply(lambda t: _meta_get(t, "Sector"))
+    ov["Industry"] = ov["Ticker"].apply(lambda t: _meta_get(t, "Industry"))
+
+    if pf_only_next:
         ov = ov[ov["Next Earnings (UTC)"].notna()].reset_index(drop=True)
 
     disp = ov.copy()
@@ -495,22 +548,42 @@ if pf_run:
         mime="text/csv",
     )
 
+    # Optional debug for one ticker
+    if debug_mode and pf_tickers:
+        st.divider()
+        st.subheader("🛠 Debug: Earnings fetch (first ticker)")
+        tk0 = pf_tickers[0]
+        st.write("Ticker:", tk0)
+        st.write("Next earnings:", fetch_next_earnings_date(tk0))
+        raw = fetch_earnings_dates_df(tk0, limit=20)
+        st.write("Raw earnings_dates table (if any):")
+        st.dataframe(raw.reset_index().rename(columns={"index": "Earnings Date"}), use_container_width=True)
+
     st.divider()
-    st.subheader("🧾 Past 4 Earnings (per holding)")
+    st.subheader("🧾 Past 4 Earnings + Price Reaction (per holding)")
 
     for tk in pf_tickers:
-        company = meta.loc[tk, "Company"] if tk in meta.index else ""
-        exp_title = f"{tk} — {company}" if company else tk
-        with st.expander(exp_title, expanded=False):
-            out = portfolio_last4_rows(tk)
+        company = _meta_get(tk, "Company")
+        title = f"{tk} — {company}" if company else tk
+
+        with st.expander(title, expanded=False):
+            # ETFs: show a friendly message
+            info = fetch_info_minimal(tk)
+            if info and _is_etf_or_fund(info):
+                st.info("This looks like an ETF/fund (no earnings events).")
+                continue
+
+            out = last4_earnings_with_context(tk)
             if out.empty:
-                st.info("No past earnings events returned by Yahoo for this ticker.")
+                st.info("No past earnings events returned by Yahoo for this ticker (endpoint can be flaky).")
                 continue
 
             disp2 = out.copy()
+
             for col in ["EPS Estimate", "Reported EPS", "Event Close (prev)"]:
                 if col in disp2.columns:
                     disp2[col] = disp2[col].apply(lambda x: _fmt_num(x, 2))
+
             for col in ["Surprise(%)", "1D Move (%)", "5D Move (%)", "Dist vs 52W High (%)", "Dist vs 52W Low (%)"]:
                 if col in disp2.columns:
                     disp2[col] = disp2[col].apply(lambda x: _fmt_pct(x, 1))
