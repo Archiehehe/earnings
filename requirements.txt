@@ -4,3 +4,4 @@ pandas
 numpy
 altair
 openpyxl
+curl_cffi
