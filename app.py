@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
 MAX_WORKERS = 8
 
-st.set_page_config(page_title="Earnings Calendar Tracker", layout="wide")
+st.set_page_config(page_title="Earnings Radar", layout="wide")
 
 # =========================
 # HELPERS
@@ -30,28 +30,40 @@ def pct(a, b):
 
 
 # =========================
-# FINNHUB
+# NEXT EARNINGS (YFINANCE)
 # =========================
-def finnhub_next_earnings(ticker, lookahead_days):
+def yf_next_earnings(ticker):
+    """Fetch next earnings date using yfinance"""
     try:
-        today = datetime.utcnow().date()
-        end = today + timedelta(days=lookahead_days)
-
-        url = (
-            "https://finnhub.io/api/v1/calendar/earnings"
-            f"?from={today}&to={end}&token={FINNHUB_API_KEY}"
-        )
-        r = requests.get(url, timeout=10).json()
-
-        for e in r.get("earningsCalendar", []):
-            if e.get("symbol") == ticker:
-                return pd.to_datetime(e["date"]).date()
+        stock = yf.Ticker(ticker)
+        
+        # Try calendar first
+        if hasattr(stock, 'calendar') and stock.calendar is not None:
+            cal = stock.calendar
+            if not cal.empty and 'Earnings Date' in cal.index:
+                earnings_date = cal.loc['Earnings Date']
+                if isinstance(earnings_date, pd.Series):
+                    earnings_date = earnings_date.iloc[0]
+                if pd.notna(earnings_date):
+                    return pd.to_datetime(earnings_date).date()
+        
+        # Try earnings_dates as fallback
+        earnings_dates = stock.earnings_dates
+        if earnings_dates is not None and not earnings_dates.empty:
+            # Filter for future dates
+            future_dates = earnings_dates[earnings_dates.index > pd.Timestamp.now()]
+            if not future_dates.empty:
+                return future_dates.index[0].date()
+                
     except Exception:
         pass
-
+    
     return None
 
 
+# =========================
+# FINNHUB (PAST EARNINGS)
+# =========================
 def finnhub_past_earnings(ticker, limit=4):
     try:
         url = f"https://finnhub.io/api/v1/stock/earnings?symbol={ticker}&token={FINNHUB_API_KEY}"
@@ -104,7 +116,7 @@ def reaction(price_df, date, days):
 # =========================
 # MAIN FETCH
 # =========================
-def fetch_all(tickers, lookahead_days, progress):
+def fetch_all(tickers, progress):
     rows = []
 
     prices_1y = yf_prices(tickers, "1y")
@@ -114,12 +126,12 @@ def fetch_all(tickers, lookahead_days, progress):
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         mcaps = dict(zip(tickers, ex.map(market_cap, tickers)))
 
-    # Next earnings (parallel)
+    # Next earnings (parallel) - NOW USING YFINANCE
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        futures = {ex.submit(finnhub_next_earnings, t, lookahead_days): t for t in tickers}
+        futures = {ex.submit(yf_next_earnings, t): t for t in tickers}
         next_earn = {futures[f]: f.result() for f in as_completed(futures)}
 
-    # Past earnings (parallel)
+    # Past earnings (parallel) - STILL USING FINNHUB
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         futures = {ex.submit(finnhub_past_earnings, t): t for t in tickers}
         past_earn = {futures[f]: f.result() for f in as_completed(futures)}
@@ -168,7 +180,7 @@ def fetch_all(tickers, lookahead_days, progress):
 # =========================
 # UI
 # =========================
-st.title("📅 Earnings Calendar Tracker")
+st.title("📊 Earnings Radar")
 
 # ---- UPLOAD FILES ----
 uploaded_files = st.file_uploader(
@@ -181,8 +193,6 @@ tickers_text = st.text_area(
     "Enter tickers (comma or newline separated)",
     "AAPL\nMSFT\nNVDA\nGOOGL",
 )
-
-lookahead_days = st.slider("Lookahead days", 30, 180, 90)
 
 # ---- PARSE TICKERS ----
 tickers = set()
@@ -218,7 +228,7 @@ if st.button("Fetch Earnings"):
         st.warning("No tickers provided")
     else:
         progress = st.progress(0.0)
-        data = fetch_all(tickers, lookahead_days, progress)
+        data = fetch_all(tickers, progress)
 
         # Flatten earnings rows
         rows = []
