@@ -94,32 +94,30 @@ def get_next_earnings(ticker):
 # =========================
 def reaction(price_df, earnings_date, days_after):
     """
-    Finds the reaction after earnings by strictly using the next 
-    available trading days, skipping weekends and holidays.
+    Finds reaction by strictly using available trading days.
     """
     try:
-        # 1. Normalize dates to compare without time
+        # Normalize index to avoid time-zone or timestamp mismatches
         price_df.index = pd.to_datetime(price_df.index).normalize()
         e_date = pd.to_datetime(earnings_date).normalize()
         
-        # 2. Get the 'Pre-Earnings' price (last close on or before earnings date)
+        # 1. Pre-Earnings: Last available close on or before earnings date
         pre_data = price_df.loc[:e_date]
-        if pre_data.empty:
-            return None
+        if pre_data.empty: return None
         pre_close = pre_data.iloc[-1]["Close"]
         
-        # 3. Get all trading days strictly AFTER the earnings date
+        # 2. Post-Earnings: All trading days strictly after the earnings date
         post_data = price_df.loc[e_date + timedelta(days=1):]
-        if post_data.empty:
-            return None
+        if post_data.empty: return None
             
-        # 4. Pick the Nth available trading day (e.g., 1st or 3rd)
-        # If we ask for 3 days but only have 2, take the latest available
+        # 3. Find target trading day
+        # If we want 1D, we take the first available day. 
+        # If we want 3D, we take the 3rd available day (or latest available if < 3)
         idx = min(days_after - 1, len(post_data) - 1)
         post_close = post_data.iloc[idx]["Close"]
         
         return pct(post_close, pre_close)
-    except Exception:
+    except:
         return None
 
 # =========================
@@ -138,7 +136,9 @@ def finnhub_past_earnings(ticker, limit=4):
 
 @st.cache_data(ttl=3600)
 def yf_prices(tickers, period):
-    return yf.download(tickers=tickers, period=period, group_by="ticker", progress=False)
+    # Ensure tickers is a list for yfinance download
+    t_list = list(tickers) if isinstance(tickers, set) else tickers
+    return yf.download(tickers=t_list, period=period, group_by="ticker", progress=False)
 
 def market_cap(ticker):
     try:
@@ -148,23 +148,24 @@ def market_cap(ticker):
 
 def fetch_all(tickers, progress):
     rows = []
+    # Fetch 2 years to ensure we have enough data for 52W metrics and reactions
     prices_2y = yf_prices(tickers, "2y")
     
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         mcaps = dict(zip(tickers, ex.map(market_cap, tickers)))
-        next_earn = {t: ex.submit(get_next_earnings, t) for t in tickers}
-        past_earn = {t: ex.submit(finnhub_past_earnings, t) for t in tickers}
+        next_earn_futures = {t: ex.submit(get_next_earnings, t) for t in tickers}
+        past_earn_futures = {t: ex.submit(finnhub_past_earnings, t) for t in tickers}
 
     for i, t in enumerate(tickers):
         try:
-            # Handle single vs multi-ticker dataframe structure
-            p2 = prices_2y[t] if len(tickers) > 1 else prices_2y
+            # Handle yfinance single vs multi-ticker data structure
+            p_data = prices_2y[t] if len(tickers) > 1 else prices_2y
             
-            current = safe_float(p2["Close"].iloc[-1])
-            high52 = safe_float(p2["High"].iloc[-252:].max()) # Approx 1yr of trading
-            low52 = safe_float(p2["Low"].iloc[-252:].min())
+            current = safe_float(p_data["Close"].iloc[-1])
+            high52 = safe_float(p_data["High"].iloc[-252:].max())
+            low52 = safe_float(p_data["Low"].iloc[-252:].min())
 
-            df_past = past_earn[t].result()
+            df_past = past_earn_futures[t].result()
             earn_rows = []
             
             if not df_past.empty:
@@ -174,11 +175,14 @@ def fetch_all(tickers, progress):
                         "EPS Actual": r.get("actual"),
                         "EPS Est.": r.get("estimate"),
                         "Surprise": r.get("surprise"),
-                        "1D Reaction %": reaction(p2, r["date"], 1),
-                        "3D Reaction %": reaction(p2, r["date"], 3),
+                        "1D Reaction %": reaction(p_data, r["date"], 1),
+                        "3D Reaction %": reaction(p_data, r["date"], 3),
                     })
             else:
-                earn_rows.append({"Date": None, "EPS Actual": None, "EPS Est.": None, "Surprise": None, "1D Reaction %": None, "3D Reaction %": None})
+                earn_rows.append({
+                    "Date": None, "EPS Actual": None, "EPS Est.": None, 
+                    "Surprise": None, "1D Reaction %": None, "3D Reaction %": None
+                })
 
             for e in earn_rows:
                 rows.append({
@@ -189,10 +193,11 @@ def fetch_all(tickers, progress):
                     "52W Low": low52,
                     "Δ vs 52W High %": pct(current, high52),
                     "Δ vs 52W Low %": pct(current, low52),
-                    "Next Earnings": next_earn[t].result(),
+                    "Next Earnings": next_earn_futures[t].result(),
                     **e
                 })
-        except: rows.append({"Ticker": t})
+        except: 
+            rows.append({"Ticker": t})
         progress.progress((i + 1) / len(tickers))
     return rows
 
@@ -201,18 +206,43 @@ def fetch_all(tickers, progress):
 # =========================
 st.title("📊 Earnings Radar")
 
-tickers_text = st.text_area("Enter tickers", "AAPL\nMSFT\nNVDA\nGOOGL")
-tickers = sorted(set(t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip()))
+# RESTORED FILE UPLOAD FEATURE
+uploaded_files = st.file_uploader(
+    "Upload CSV or Excel files (Ticker column required)",
+    type=["csv", "xlsx", "xls"],
+    accept_multiple_files=True,
+)
+
+tickers_text = st.text_area("Enter tickers (comma or newline separated)", "AAPL\nMSFT\nNVDA\nGOOGL")
+
+# PARSING TICKERS FROM TEXT AND UPLOADED FILES
+tickers = set()
+
+if uploaded_files:
+    for f in uploaded_files:
+        try:
+            df_upload = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
+            for col in ["Ticker", "Symbol", "ticker", "symbol"]:
+                if col in df_upload.columns:
+                    tickers.update(df_upload[col].dropna().astype(str).str.upper())
+                    break
+        except: 
+            st.warning(f"Could not read {f.name}")
+
+tickers.update(t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip())
+ticker_list = sorted(list(tickers))
 
 if st.button("Fetch Earnings"):
-    if not tickers:
+    if not ticker_list:
         st.warning("No tickers provided")
     else:
         progress = st.progress(0.0)
-        final_rows = fetch_all(tickers, progress)
+        final_rows = fetch_all(ticker_list, progress)
         df_result = pd.DataFrame(final_rows)
         
         pct_cols = ["Δ vs 52W High %", "Δ vs 52W Low %", "1D Reaction %", "3D Reaction %"]
+        
+        # Formatted Display
         st.dataframe(
             df_result, 
             use_container_width=True,
