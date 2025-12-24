@@ -2,20 +2,23 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import requests
+import io
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
+from groq import Groq  # Free AI Provider
 
 # =========================
 # CONFIG
 # =========================
 FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 MAX_WORKERS = 8
 
 st.set_page_config(page_title="Earnings Radar", layout="wide")
 
 # =========================
-# HELPERS
+# HELPERS (Radar Tab)
 # =========================
 def safe_float(x):
     try:
@@ -78,10 +81,8 @@ def get_next_earnings_yf_calendar(ticker):
         stock = yf.Ticker(ticker)
         cal = stock.calendar
         if cal is not None and not cal.empty:
-            # Check for Earnings Date row
             if 'Earnings Date' in cal.index:
                 dates = cal.loc['Earnings Date']
-                # If multiple dates provided, check each
                 if isinstance(dates, (list, pd.Series)):
                     for d in dates:
                         dt = pd.to_datetime(d).date()
@@ -122,7 +123,7 @@ def get_next_earnings(ticker):
         result = method(ticker)
         if result and is_future(result):
             return result
-    return "TBD"  # Return TBD if no future date is found
+    return "TBD"
 
 # =========================
 # FINNHUB (PAST EARNINGS)
@@ -217,7 +218,6 @@ def fetch_all(tickers, progress):
                         "3D Reaction %": reaction(p2, r["date"], 3),
                     })
             
-            # If no historical earnings found, create a placeholder row
             if not earn_rows:
                 earn_rows.append({
                     "Date": None, "EPS Actual": None, "EPS Est.": None,
@@ -242,34 +242,86 @@ def fetch_all(tickers, progress):
     return rows
 
 # =========================
-# UI
+# AI SENTIMENT HELPERS (Tab 2)
 # =========================
-st.title("📊 Earnings Radar")
+def fetch_transcript_text(url):
+    try:
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        text = " ".join([p.get_text() for p in soup.find_all('p')])
+        return text[:12000] # Trim for API limits
+    except Exception as e:
+        return f"Error: {str(e)}"
 
-uploaded_files = st.file_uploader("Upload CSV or Excel files", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
-tickers_text = st.text_area("Enter tickers", "AAPL\nMSFT\nNVDA\nGOOGL")
+def analyze_with_groq(ticker, text):
+    if not GROQ_API_KEY:
+        return {"summary": "Missing API Key", "sentiment": 3, "notes": "Add GROQ_API_KEY to Secrets"}
+    client = Groq(api_key=GROQ_API_KEY)
+    prompt = f"Analyze this earnings transcript for {ticker}. Return a JSON with: 'summary' (2 sentences), 'sentiment' (Score 1-5), and 'notes' (2 risks/catalysts).\n\nTranscript: {text[:5000]}"
+    try:
+        res = client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama3-8b-8192", response_format={"type": "json_object"})
+        import json
+        return json.loads(res.choices[0].message.content)
+    except:
+        return {"summary": "Failed", "sentiment": 0, "notes": "N/A"}
 
-tickers = set()
-if uploaded_files:
-    for f in uploaded_files:
-        try:
-            df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
-            for col in ["Ticker", "Symbol", "ticker", "symbol"]:
-                if col in df.columns:
-                    tickers.update(df[col].dropna().astype(str).str.upper())
-                    break
-        except: st.warning(f"Could not read {f.name}")
+# =========================
+# UI LAYOUT
+# =========================
+tab1, tab2 = st.tabs(["📊 Earnings Radar", "🤖 AI Sentiment Analyzer"])
 
-tickers.update(t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip())
-tickers = sorted(tickers)
+# ---- TAB 1: RADAR (UNCHANGED LOGIC) ----
+with tab1:
+    st.title("📊 Earnings Radar")
+    uploaded_files = st.file_uploader("Upload CSV or Excel files", type=["csv", "xlsx", "xls"], accept_multiple_files=True, key="radar_files")
+    tickers_text = st.text_area("Enter tickers", "AAPL\nMSFT\nNVDA\nGOOGL", key="radar_text")
 
-if st.button("Fetch Earnings"):
-    if not tickers:
-        st.warning("No tickers provided")
-    else:
-        progress = st.progress(0.0)
-        final_rows = fetch_all(tickers, progress)
-        df_result = pd.DataFrame(final_rows)
-        st.dataframe(df_result, use_container_width=True)
+    tickers_list = set()
+    if uploaded_files:
+        for f in uploaded_files:
+            try:
+                df = pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
+                for col in ["Ticker", "Symbol", "ticker", "symbol"]:
+                    if col in df.columns:
+                        tickers_list.update(df[col].dropna().astype(str).str.upper())
+                        break
+            except: st.warning(f"Could not read {f.name}")
 
+    tickers_list.update(t.strip().upper() for t in tickers_text.replace(",", "\n").split() if t.strip())
+    sorted_tickers = sorted(tickers_list)
 
+    if st.button("Fetch Earnings"):
+        if not sorted_tickers:
+            st.warning("No tickers provided")
+        else:
+            progress = st.progress(0.0)
+            final_rows = fetch_all(sorted_tickers, progress)
+            df_result = pd.DataFrame(final_rows)
+            st.dataframe(df_result, use_container_width=True)
+
+# ---- TAB 2: SENTIMENT ANALYZER (NEW) ----
+with tab2:
+    st.title("🤖 AI Sentiment Analyzer")
+    st.write("Upload a CSV or Excel with columns: **Ticker** and **URL**.")
+    up_sent = st.file_uploader("Upload Transcript List", type=["csv", "xlsx", "xls"], key="sent_files")
+    
+    if up_sent:
+        df_sent = pd.read_csv(up_sent) if up_sent.name.endswith(".csv") else pd.read_excel(up_sent)
+        if st.button("Start AI Analysis"):
+            results = []
+            prog_sent = st.progress(0.0)
+            for idx, row in df_sent.iterrows():
+                ticker = str(row.get('Ticker', row.get('ticker', '')))
+                url = str(row.get('URL', row.get('url', '')))
+                if ticker and url:
+                    st.write(f"Analyzing {ticker}...")
+                    text = fetch_transcript_text(url)
+                    analysis = analyze_with_groq(ticker, text)
+                    results.append({"Ticker": ticker, "Sentiment": analysis.get('sentiment'), "Summary": analysis.get('summary'), "Notes": analysis.get('notes')})
+                prog_sent.progress((idx + 1) / len(df_sent))
+            
+            final_ai_df = pd.DataFrame(results)
+            st.dataframe(final_ai_df, use_container_width=True)
+            if not final_ai_df.empty:
+                st.bar_chart(final_ai_df.set_index("Ticker")["Sentiment"])
+            st.download_button("Download AI Report", final_ai_df.to_csv(index=False), "sentiment_report.csv")
