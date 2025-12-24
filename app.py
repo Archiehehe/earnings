@@ -211,11 +211,31 @@ def market_cap(ticker):
 # =========================
 # REACTIONS
 # =========================
-def reaction(price_df, date, days):
+def reaction(price_df, date, trading_days):
+    """Calculate price reaction using actual trading days, not calendar days"""
     try:
         d = pd.to_datetime(date).normalize()
-        pre = price_df.loc[:d].iloc[-1]["Close"]
-        post = price_df.loc[d + timedelta(days=days):].iloc[0]["Close"]
+        
+        # Get price on or before earnings date
+        pre_data = price_df.loc[:d]
+        if pre_data.empty:
+            return None
+        pre = pre_data.iloc[-1]["Close"]
+        
+        # Get prices after earnings date
+        post_data = price_df.loc[d + timedelta(days=1):]
+        if post_data.empty:
+            return None
+        
+        # For 1-day: use next trading day
+        if trading_days == 1:
+            post = post_data.iloc[0]["Close"]
+        # For 3-day: use the trading day closest to 3 days later (or 3rd trading day)
+        else:
+            # Try to get 3rd trading day, or whatever we have
+            idx = min(trading_days - 1, len(post_data) - 1)
+            post = post_data.iloc[idx]["Close"]
+        
         return pct(post, pre)
     except Exception:
         return None
@@ -354,3 +374,4 @@ if st.button("Fetch Earnings"):
 
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True)
+        
