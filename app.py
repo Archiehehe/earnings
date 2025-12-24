@@ -4,6 +4,7 @@ import yfinance as yf
 import requests
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from bs4 import BeautifulSoup
 
 # =========================
 # CONFIG
@@ -30,33 +31,140 @@ def pct(a, b):
 
 
 # =========================
-# NEXT EARNINGS (YFINANCE)
+# NEXT EARNINGS (MULTIPLE METHODS)
 # =========================
-def yf_next_earnings(ticker):
-    """Fetch next earnings date using yfinance"""
+def get_next_earnings_yahoo_scrape(ticker):
+    """Scrape next earnings from Yahoo Finance page"""
+    try:
+        url = f"https://finance.yahoo.com/quote/{ticker}"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Look for earnings date in the page
+        text = response.text
+        if 'Earnings Date' in text:
+            # Try to extract date near "Earnings Date"
+            start = text.find('Earnings Date')
+            if start != -1:
+                snippet = text[start:start+200]
+                # Look for date patterns
+                import re
+                date_pattern = r'(\w{3}\s+\d{1,2},\s+\d{4})'
+                match = re.search(date_pattern, snippet)
+                if match:
+                    date_str = match.group(1)
+                    return pd.to_datetime(date_str).date()
+    except Exception:
+        pass
+    return None
+
+
+def get_next_earnings_yf_info(ticker):
+    """Try yfinance info method"""
     try:
         stock = yf.Ticker(ticker)
+        info = stock.info
         
-        # Try calendar first
-        if hasattr(stock, 'calendar') and stock.calendar is not None:
-            cal = stock.calendar
-            if not cal.empty and 'Earnings Date' in cal.index:
+        # Check various possible fields
+        for field in ['earningsDate', 'earningsTimestamp', 'nextEarningsDate']:
+            if field in info and info[field]:
+                try:
+                    if isinstance(info[field], list):
+                        date_val = info[field][0]
+                    else:
+                        date_val = info[field]
+                    
+                    if isinstance(date_val, (int, float)):
+                        return pd.to_datetime(date_val, unit='s').date()
+                    else:
+                        return pd.to_datetime(date_val).date()
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def get_next_earnings_yf_calendar(ticker):
+    """Try yfinance calendar"""
+    try:
+        stock = yf.Ticker(ticker)
+        cal = stock.calendar
+        
+        if cal is not None and not cal.empty:
+            if 'Earnings Date' in cal.index:
                 earnings_date = cal.loc['Earnings Date']
                 if isinstance(earnings_date, pd.Series):
                     earnings_date = earnings_date.iloc[0]
                 if pd.notna(earnings_date):
                     return pd.to_datetime(earnings_date).date()
-        
-        # Try earnings_dates as fallback
-        earnings_dates = stock.earnings_dates
-        if earnings_dates is not None and not earnings_dates.empty:
-            # Filter for future dates
-            future_dates = earnings_dates[earnings_dates.index > pd.Timestamp.now()]
-            if not future_dates.empty:
-                return future_dates.index[0].date()
-                
     except Exception:
         pass
+    return None
+
+
+def get_next_earnings_fmp(ticker):
+    """Try Financial Modeling Prep API (free tier)"""
+    try:
+        url = f"https://financialmodelingprep.com/api/v3/earning_calendar?symbol={ticker}"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        if data and len(data) > 0:
+            # Get the first (most recent/upcoming) earnings date
+            date_str = data[0].get('date')
+            if date_str:
+                date = pd.to_datetime(date_str).date()
+                # Only return if it's in the future
+                if date >= datetime.now().date():
+                    return date
+    except Exception:
+        pass
+    return None
+
+
+def get_next_earnings_alpha_vantage(ticker):
+    """Try Alpha Vantage (free tier, no key needed for basic data)"""
+    try:
+        url = f"https://www.alphavantage.co/query?function=EARNINGS_CALENDAR&symbol={ticker}&horizon=3month"
+        response = requests.get(url, timeout=10)
+        
+        if response.status_code == 200:
+            lines = response.text.strip().split('\n')
+            if len(lines) > 1:
+                # Parse CSV response
+                import csv
+                reader = csv.DictReader(lines)
+                for row in reader:
+                    if row.get('symbol') == ticker:
+                        date_str = row.get('reportDate')
+                        if date_str:
+                            date = pd.to_datetime(date_str).date()
+                            if date >= datetime.now().date():
+                                return date
+    except Exception:
+        pass
+    return None
+
+
+def get_next_earnings(ticker):
+    """Try multiple methods to get next earnings date"""
+    methods = [
+        get_next_earnings_yf_info,
+        get_next_earnings_yf_calendar,
+        get_next_earnings_fmp,
+        get_next_earnings_yahoo_scrape,
+        get_next_earnings_alpha_vantage,
+    ]
+    
+    for method in methods:
+        try:
+            result = method(ticker)
+            if result:
+                return result
+        except Exception:
+            continue
     
     return None
 
@@ -126,9 +234,9 @@ def fetch_all(tickers, progress):
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
         mcaps = dict(zip(tickers, ex.map(market_cap, tickers)))
 
-    # Next earnings (parallel) - NOW USING YFINANCE
+    # Next earnings (parallel) - MULTIPLE FALLBACK METHODS
     with ThreadPoolExecutor(MAX_WORKERS) as ex:
-        futures = {ex.submit(yf_next_earnings, t): t for t in tickers}
+        futures = {ex.submit(get_next_earnings, t): t for t in tickers}
         next_earn = {futures[f]: f.result() for f in as_completed(futures)}
 
     # Past earnings (parallel) - STILL USING FINNHUB
