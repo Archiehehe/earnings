@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import requests
+import io
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
@@ -294,4 +295,22 @@ if st.button("Fetch Earnings"):
                 col: st.column_config.NumberColumn(format="%.2f%%") 
                 for col in pct_cols
             }
+        )
+
+        # --- EXPORT TO EXCEL ---
+        st.divider()
+        
+        # Create a buffer for the Excel file
+        buffer = io.BytesIO()
+        
+        # Use xlsxwriter to handle the Excel creation in memory
+        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+            df_result.to_excel(writer, index=False, sheet_name='Earnings_Report')
+            
+        # Download button appears after dataframe generation
+        st.download_button(
+            label="📥 Download Results as Excel",
+            data=buffer.getvalue(),
+            file_name=f"earnings_radar_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
